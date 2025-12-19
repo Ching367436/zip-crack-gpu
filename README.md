@@ -67,6 +67,23 @@ A GPU-accelerated Zip password cracker using CUDA. This project implements a cus
 ./final_project test_gigantic.zip rockyou.txt 2000
 ```
 
+## Performance Profiling
+
+Enable a simple per-stage timing breakdown (CPU read/pack, H2D, kernel, D2H, CPU verify):
+
+```bash
+ZIPCRACK_TIMING=1 ./final_project <zip_file> <wordlist>
+```
+
+### Password Packing
+
+To reduce H2D bandwidth, passwords are packed into a flat byte buffer plus per-password offsets before being copied to the GPU.
+Very long passwords can increase buffer size and reduce overlap, so you can cap the maximum password length (longer lines are skipped):
+
+```bash
+ZIPCRACK_MAX_PW_BYTES=64 ./final_project <zip_file> <wordlist>
+```
+
 ## Project Structure
 
 - `final_project.cu`: Main host code, handles file I/O and orchestrates the cracking process.
