@@ -1,0 +1,6 @@
+[submodule "deps/minizip-ng"]
+	path = deps/minizip-ng
+	url = https://github.com/zlib-ng/minizip-ng.git
+[submodule "deps/john"]
+	path = deps/john
+	url = https://github.com/openwall/john.git

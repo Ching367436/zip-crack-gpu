@@ -1,0 +1,30 @@
+# Binaries
+final_project
+*.o
+*.a
+*.so
+*.d
+
+# Dependencies build artifacts
+deps/minizip-ng/build/
+deps/john/run/
+deps/john/src/john
+deps/john/src/zip2john
+
+# Data files
+*.zip
+*.hash
+*.txt
+!CMakeLists.txt
+!requirements.txt
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
