@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <chrono>
 #include <cstdlib>
+#include <atomic>
+#include <memory>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -340,14 +342,84 @@ int main(int argc, char **argv) {
     cudaMalloc(&d_digest, sizeof(digest_t));
     cudaMemcpy(d_digest, &h_digest, sizeof(digest_t), cudaMemcpyHostToDevice);
 
-    // 3. Setup Device Memory for Passwords and Results
-    pw_t *h_pws = new pw_t[BATCH_SIZE];
-    u32 *h_match = new u32[BATCH_SIZE];
+    // 3. Setup Device + Host Memory for Passwords and Results (double-buffered)
+    constexpr int kBuffers = 2;
 
-    pw_t *d_pws;
-    u32 *d_match;
-    cudaMalloc(&d_pws, BATCH_SIZE * sizeof(pw_t));
-    cudaMalloc(&d_match, BATCH_SIZE * sizeof(u32));
+    pw_t *h_pws[kBuffers] = {nullptr, nullptr};
+    u32  *h_match[kBuffers] = {nullptr, nullptr};
+
+    std::unique_ptr<pw_t[]> h_pws_pageable[kBuffers];
+    std::unique_ptr<u32[]>  h_match_pageable[kBuffers];
+
+    bool use_pinned = true;
+    for (int i = 0; i < kBuffers; i++)
+    {
+        if (cudaMallocHost(&h_pws[i], BATCH_SIZE * sizeof(pw_t)) != cudaSuccess ||
+            cudaMallocHost(&h_match[i], BATCH_SIZE * sizeof(u32)) != cudaSuccess)
+        {
+            use_pinned = false;
+            break;
+        }
+    }
+
+    if (!use_pinned)
+    {
+        std::cerr << "Warning: cudaMallocHost failed; falling back to pageable host buffers (no H2D overlap)." << std::endl;
+
+        for (int i = 0; i < kBuffers; i++)
+        {
+            if (h_pws[i]) cudaFreeHost(h_pws[i]);
+            if (h_match[i]) cudaFreeHost(h_match[i]);
+            h_pws[i] = nullptr;
+            h_match[i] = nullptr;
+        }
+
+        for (int i = 0; i < kBuffers; i++)
+        {
+            h_pws_pageable[i] = std::make_unique<pw_t[]>(BATCH_SIZE);
+            h_match_pageable[i] = std::make_unique<u32[]>(BATCH_SIZE);
+            h_pws[i] = h_pws_pageable[i].get();
+            h_match[i] = h_match_pageable[i].get();
+        }
+    }
+
+    pw_t *d_pws[kBuffers] = {nullptr, nullptr};
+    u32  *d_match[kBuffers] = {nullptr, nullptr};
+
+    for (int i = 0; i < kBuffers; i++)
+    {
+        cudaMalloc(&d_pws[i], BATCH_SIZE * sizeof(pw_t));
+        cudaMalloc(&d_match[i], BATCH_SIZE * sizeof(u32));
+    }
+
+    cudaStream_t streams[kBuffers]{};
+    for (int i = 0; i < kBuffers; i++)
+    {
+        cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
+    }
+
+    cudaEvent_t ev_done[kBuffers]{};
+    for (int i = 0; i < kBuffers; i++)
+    {
+        cudaEventCreateWithFlags(&ev_done[i], cudaEventDisableTiming);
+    }
+
+    cudaEvent_t ev_h2d_start[kBuffers]{}, ev_h2d_stop[kBuffers]{};
+    cudaEvent_t ev_k_start[kBuffers]{}, ev_k_stop[kBuffers]{};
+    cudaEvent_t ev_d2h_start[kBuffers]{}, ev_d2h_stop[kBuffers]{};
+
+    if (timing)
+    {
+        for (int i = 0; i < kBuffers; i++)
+        {
+            cudaEventCreate(&ev_h2d_start[i]);
+            cudaEventCreate(&ev_h2d_stop[i]);
+            cudaEventCreate(&ev_k_start[i]);
+            cudaEventCreate(&ev_k_stop[i]);
+            cudaEventCreate(&ev_d2h_start[i]);
+            cudaEventCreate(&ev_d2h_stop[i]);
+        }
+    }
 
     // 4. Read Dictionary and Run
     std::ifstream dict_file(dict_file_path);
@@ -357,153 +429,202 @@ int main(int argc, char **argv) {
     }
 
     std::string pw_line;
-    size_t batch_count = 0;
-    bool found = false;
+    std::atomic<bool> found{false};
     std::string correct_password;
+    std::atomic<bool> fatal_error{false};
+    std::string fatal_error_msg;
 
-    cudaEvent_t ev_k_start{};
-    cudaEvent_t ev_k_stop{};
-    cudaEventCreate(&ev_k_start);
-    cudaEventCreate(&ev_k_stop);
-
-    auto batch_read_start = clock::now();
-
-    auto run_gpu_filter = [&] (size_t count) {
+    auto fill_batch = [&] (int buf) -> size_t {
         const auto t0 = clock::now();
-        cudaMemcpy(d_pws, h_pws, count * sizeof(pw_t), cudaMemcpyHostToDevice);
-        const auto t1 = clock::now();
-        h2d_ms += ms_since(t1 - t0);
 
+        size_t count = 0;
+        while (count < BATCH_SIZE && std::getline(dict_file, pw_line))
+        {
+            if (!pw_line.empty() && pw_line.back() == '\r') pw_line.pop_back();
+            pack_password(pw_line, h_pws[buf][count]);
+            count++;
+        }
+
+        cpu_read_pack_ms += ms_since(clock::now() - t0);
+        return count;
+    };
+
+    auto launch_gpu = [&] (int buf, size_t count) {
         const int threadsPerBlock = 256;
         const int blocksPerGrid = static_cast<int>((count + threadsPerBlock - 1) / threadsPerBlock);
 
-        cudaEventRecord(ev_k_start);
-        m17200_sxx_cuda_optimized<<<blocksPerGrid, threadsPerBlock>>>(d_pkzip, d_digest, d_pws, (u32)count, d_match);
-        cudaEventRecord(ev_k_stop);
-        cudaEventSynchronize(ev_k_stop);
+        if (timing) cudaEventRecord(ev_h2d_start[buf], streams[buf]);
+        cudaMemcpyAsync(d_pws[buf], h_pws[buf], count * sizeof(pw_t), cudaMemcpyHostToDevice, streams[buf]);
+        if (timing) cudaEventRecord(ev_h2d_stop[buf], streams[buf]);
+
+        if (timing) cudaEventRecord(ev_k_start[buf], streams[buf]);
+        m17200_sxx_cuda_optimized<<<blocksPerGrid, threadsPerBlock, 0, streams[buf]>>>(d_pkzip, d_digest, d_pws[buf], (u32)count, d_match[buf]);
+        if (timing) cudaEventRecord(ev_k_stop[buf], streams[buf]);
+
+        if (timing) cudaEventRecord(ev_d2h_start[buf], streams[buf]);
+        cudaMemcpyAsync(h_match[buf], d_match[buf], count * sizeof(u32), cudaMemcpyDeviceToHost, streams[buf]);
+        if (timing) cudaEventRecord(ev_d2h_stop[buf], streams[buf]);
+
+        cudaEventRecord(ev_done[buf], streams[buf]);
+    };
+
+    auto process_results = [&] (int buf, size_t count) {
+        cudaEventSynchronize(ev_done[buf]);
 
         if (timing)
         {
             float ms = 0.0f;
-            cudaEventElapsedTime(&ms, ev_k_start, ev_k_stop);
+
+            cudaEventElapsedTime(&ms, ev_h2d_start[buf], ev_h2d_stop[buf]);
+            h2d_ms += ms;
+
+            cudaEventElapsedTime(&ms, ev_k_start[buf], ev_k_stop[buf]);
             kernel_ms += ms;
+
+            cudaEventElapsedTime(&ms, ev_d2h_start[buf], ev_d2h_stop[buf]);
+            d2h_ms += ms;
         }
 
-        const auto t2 = clock::now();
-        cudaMemcpy(h_match, d_match, count * sizeof(u32), cudaMemcpyDeviceToHost);
-        const auto t3 = clock::now();
-        d2h_ms += ms_since(t3 - t2);
-    };
+        std::vector<std::string> candidates;
+        candidates.reserve(64);
 
-    while (std::getline(dict_file, pw_line) && !found) {
-        if (!pw_line.empty() && pw_line.back() == '\r') pw_line.pop_back();
+        for (size_t i = 0; i < count; i++)
+        {
+            if (h_match[buf][i] != 1) continue;
 
-        pack_password(pw_line, h_pws[batch_count]);
-        batch_count++;
+            const pw_t &pw = h_pws[buf][i];
+            std::string candidate;
+            candidate.resize(pw.pw_len);
+            if (pw.pw_len) std::memcpy(candidate.data(), pw.i, pw.pw_len);
+            candidates.push_back(std::move(candidate));
+        }
 
-        if (batch_count == BATCH_SIZE) {
-            cpu_read_pack_ms += ms_since(clock::now() - batch_read_start);
+        total_gpu_matches += candidates.size();
 
-            // GPU Filter
-            run_gpu_filter(BATCH_SIZE);
-            total_pw_tested += BATCH_SIZE;
+        if (!candidates.empty())
+        {
+            const auto v0 = clock::now();
+            #pragma omp parallel for shared(found, correct_password, fatal_error, fatal_error_msg)
+            for (size_t i = 0; i < candidates.size(); i++) {
+                if (found.load(std::memory_order_relaxed) || fatal_error.load(std::memory_order_relaxed)) continue;
 
-            // Collect candidates
-            std::vector<u32> candidates;
-            for (size_t i = 0; i < BATCH_SIZE; i++) {
-                if (h_match[i] == 1) {
-                    candidates.push_back((u32)i);
-                }
-            }
-            total_gpu_matches += candidates.size();
-
-            // CPU Parallel Verification
-            if (!candidates.empty()) {
-                try {
-                    const auto v0 = clock::now();
-                    #pragma omp parallel for shared(found, correct_password)
-                    for (size_t i = 0; i < candidates.size(); i++) {
-                        if (found) continue; // Early exit if found by another thread
-
-                        const pw_t &pw = h_pws[candidates[i]];
-                        std::string candidate;
-                        candidate.resize(pw.pw_len);
-                        if (pw.pw_len) std::memcpy(candidate.data(), pw.i, pw.pw_len);
-
-                        if (try_unzip_with_password(candidate.c_str(), zip_file_path.c_str())) {
-                            #pragma omp critical
+                try
+                {
+                    if (try_unzip_with_password(candidates[i].c_str(), zip_file_path.c_str())) {
+                        #pragma omp critical
+                        {
+                            if (!found.load(std::memory_order_relaxed))
                             {
-                                found = true;
-                                correct_password = candidate;
+                                found.store(true, std::memory_order_relaxed);
+                                correct_password = candidates[i];
                             }
                         }
                     }
-                    cpu_verify_ms += ms_since(clock::now() - v0);
-                } catch (const std::runtime_error& e) {
-                    std::cerr << "Fatal Error: " << e.what() << std::endl;
-                    return 1;
                 }
-            }
-
-            batch_count = 0;
-            batch_read_start = clock::now();
-        }
-    }
-
-    // Process remaining
-    if (batch_count && !found) {
-        const size_t count = batch_count;
-        cpu_read_pack_ms += ms_since(clock::now() - batch_read_start);
-
-        run_gpu_filter(count);
-        total_pw_tested += count;
-
-        std::vector<u32> candidates;
-        for (size_t i = 0; i < count; i++) {
-            if (h_match[i] == 1) {
-                candidates.push_back((u32)i);
-            }
-        }
-        total_gpu_matches += candidates.size();
-
-        if (!candidates.empty()) {
-            try {
-                const auto v0 = clock::now();
-                #pragma omp parallel for shared(found, correct_password)
-                for (size_t i = 0; i < candidates.size(); i++) {
-                    if (found) continue;
-
-                    const pw_t &pw = h_pws[candidates[i]];
-                    std::string candidate;
-                    candidate.resize(pw.pw_len);
-                    if (pw.pw_len) std::memcpy(candidate.data(), pw.i, pw.pw_len);
-
-                    if (try_unzip_with_password(candidate.c_str(), zip_file_path.c_str())) {
-                        #pragma omp critical
-                        {
-                            found = true;
-                            correct_password = candidate;
-                        }
+                catch (const std::runtime_error &e)
+                {
+                    #pragma omp critical
+                    {
+                        fatal_error.store(true, std::memory_order_relaxed);
+                        fatal_error_msg = e.what();
                     }
                 }
-                cpu_verify_ms += ms_since(clock::now() - v0);
-            } catch (const std::runtime_error& e) {
-                std::cerr << "Fatal Error: " << e.what() << std::endl;
-                return 1;
             }
+            cpu_verify_ms += ms_since(clock::now() - v0);
+        }
+    };
+
+    size_t count[kBuffers] = {0, 0};
+    bool in_flight[kBuffers] = {false, false};
+    bool eof = false;
+
+    // Prime pipeline (up to 2 batches)
+    for (int i = 0; i < kBuffers; i++)
+    {
+        count[i] = fill_batch(i);
+        if (count[i] == 0)
+        {
+            eof = true;
+            break;
+        }
+        launch_gpu(i, count[i]);
+        in_flight[i] = true;
+        total_pw_tested += count[i];
+    }
+
+    int proc = 0;
+    while ((in_flight[0] || in_flight[1]) && !found.load(std::memory_order_relaxed) &&
+           !fatal_error.load(std::memory_order_relaxed))
+    {
+        if (in_flight[proc])
+        {
+            process_results(proc, count[proc]);
+            in_flight[proc] = false;
+            if (found.load(std::memory_order_relaxed) || fatal_error.load(std::memory_order_relaxed)) break;
+        }
+
+        if (!eof && !fatal_error.load(std::memory_order_relaxed))
+        {
+            count[proc] = fill_batch(proc);
+            if (count[proc] == 0)
+            {
+                eof = true;
+            }
+            else
+            {
+                launch_gpu(proc, count[proc]);
+                in_flight[proc] = true;
+                total_pw_tested += count[proc];
+            }
+        }
+
+        proc = 1 - proc;
+    }
+
+    // Cleanup
+    cudaDeviceSynchronize();
+
+    if (timing)
+    {
+        for (int i = 0; i < kBuffers; i++)
+        {
+            cudaEventDestroy(ev_h2d_start[i]);
+            cudaEventDestroy(ev_h2d_stop[i]);
+            cudaEventDestroy(ev_k_start[i]);
+            cudaEventDestroy(ev_k_stop[i]);
+            cudaEventDestroy(ev_d2h_start[i]);
+            cudaEventDestroy(ev_d2h_stop[i]);
         }
     }
 
-    cudaEventDestroy(ev_k_start);
-    cudaEventDestroy(ev_k_stop);
+    for (int i = 0; i < kBuffers; i++)
+    {
+        cudaEventDestroy(ev_done[i]);
+        cudaStreamDestroy(streams[i]);
+    }
 
-    // Cleanup
-    delete[] h_pws;
-    delete[] h_match;
+    if (use_pinned)
+    {
+        for (int i = 0; i < kBuffers; i++)
+        {
+            cudaFreeHost(h_pws[i]);
+            cudaFreeHost(h_match[i]);
+        }
+    }
+
     cudaFree(d_pkzip);
     cudaFree(d_digest);
-    cudaFree(d_pws);
-    cudaFree(d_match);
+    for (int i = 0; i < kBuffers; i++)
+    {
+        cudaFree(d_pws[i]);
+        cudaFree(d_match[i]);
+    }
+
+    if (fatal_error.load(std::memory_order_relaxed))
+    {
+        std::cerr << "Fatal Error: " << fatal_error_msg << std::endl;
+        return 1;
+    }
 
     if (timing)
     {
@@ -517,7 +638,7 @@ int main(int argc, char **argv) {
         std::cerr << "  D2H:      " << std::fixed << std::setprecision(2) << d2h_ms << " ms\n";
     }
 
-    if (found) {
+    if (found.load(std::memory_order_relaxed)) {
         std::cout << "FOUND PASSWORD: " << correct_password << std::endl;
         return 0;
     } else {
