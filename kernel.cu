@@ -15,47 +15,8 @@ using u32 = uint32_t;
 #define MSB(x) ((x) >> 24)
 #define CONST_PK 0x08088405
 
-// ---------------------- Helpers ---------------------------
-__device__ __forceinline__ u32 crc32_device(u32 x, u32 c, const u32 *t)
-{
-    return (x >> 8) ^ t[(x ^ c) & 0xff];
-}
-
-__device__ __forceinline__ void update_key012(u32 &k0, u32 &k1, u32 &k2, u32 c, const u32 *t)
-{
-    k0 = crc32_device(k0, c, t);
-    k1 = (k1 + (k0 & 0xff)) * CONST_PK + 1;
-    k2 = crc32_device(k2, MSB(k1), t);
-}
-
-__device__ __forceinline__ void update_key3(u32 k2, u32 &k3)
-{
-    const u32 temp = (k2 & 0xffff) | 3;
-    k3 = ((temp * (temp ^ 1)) >> 8) & 0xff;
-}
-
-__device__ __forceinline__ u32 unpack_v8a_from_v32(u32 v) { return (v >> 0) & 0xff; }
-__device__ __forceinline__ u32 unpack_v8b_from_v32(u32 v) { return (v >> 8) & 0xff; }
-__device__ __forceinline__ u32 unpack_v8c_from_v32(u32 v) { return (v >> 16) & 0xff; }
-__device__ __forceinline__ u32 unpack_v8d_from_v32(u32 v) { return (v >> 24) & 0xff; }
-
-__device__ __forceinline__ u32 get_byte_24 (const u32 w0, const u32 w1, const u32 w2, const u32 w3, const u32 w4, const u32 w5, const u32 idx)
-{
-    const u32 shift = (idx & 3u) << 3;
-
-    switch (idx >> 2)
-    {
-      case 0: return (w0 >> shift) & 0xff;
-      case 1: return (w1 >> shift) & 0xff;
-      case 2: return (w2 >> shift) & 0xff;
-      case 3: return (w3 >> shift) & 0xff;
-      case 4: return (w4 >> shift) & 0xff;
-      default: return (w5 >> shift) & 0xff;
-    }
-}
-
 // ---------------------- CRC32 table -----------------------
-__device__ __constant__ u32 crc32tab[256] = {
+__device__ __align__(16) const u32 crc32tab[256] = {
     0x00000000,0x77073096,0xee0e612c,0x990951ba,0x076dc419,0x706af48f,0xe963a535,0x9e6495a3,
     0x0edb8832,0x79dcb8a4,0xe0d5e91e,0x97d2d988,0x09b64c2b,0x7eb17cbd,0xe7b82d07,0x90bf1d91,
     0x1db71064,0x6ab020f2,0xf3b97148,0x84be41de,0x1adad47d,0x6ddde4eb,0xf4d4b551,0x83d385c7,
@@ -89,6 +50,45 @@ __device__ __constant__ u32 crc32tab[256] = {
     0xbdbdf21c,0xcabac28a,0x53b39330,0x24b4a3a6,0xbad03605,0xcdd70693,0x54de5729,0x23d967bf,
     0xb3667a2e,0xc4614ab8,0x5d681b02,0x2a6f2b94,0xb40bbe37,0xc30c8ea1,0x5a05df1b,0x2d02ef8d
 };
+
+// ---------------------- Helpers ---------------------------
+__device__ __forceinline__ u32 crc32_device(u32 x, u32 c)
+{
+    return (x >> 8) ^ __ldg(&crc32tab[(x ^ c) & 0xff]);
+}
+
+__device__ __forceinline__ void update_key012(u32 &k0, u32 &k1, u32 &k2, u32 c)
+{
+    k0 = crc32_device(k0, c);
+    k1 = (k1 + (k0 & 0xff)) * CONST_PK + 1;
+    k2 = crc32_device(k2, MSB(k1));
+}
+
+__device__ __forceinline__ void update_key3(u32 k2, u32 &k3)
+{
+    const u32 temp = (k2 & 0xffff) | 3;
+    k3 = ((temp * (temp ^ 1)) >> 8) & 0xff;
+}
+
+__device__ __forceinline__ u32 unpack_v8a_from_v32(u32 v) { return (v >> 0) & 0xff; }
+__device__ __forceinline__ u32 unpack_v8b_from_v32(u32 v) { return (v >> 8) & 0xff; }
+__device__ __forceinline__ u32 unpack_v8c_from_v32(u32 v) { return (v >> 16) & 0xff; }
+__device__ __forceinline__ u32 unpack_v8d_from_v32(u32 v) { return (v >> 24) & 0xff; }
+
+__device__ __forceinline__ u32 get_byte_24 (const u32 w0, const u32 w1, const u32 w2, const u32 w3, const u32 w4, const u32 w5, const u32 idx)
+{
+    const u32 shift = (idx & 3u) << 3;
+
+    switch (idx >> 2)
+    {
+      case 0: return (w0 >> shift) & 0xff;
+      case 1: return (w1 >> shift) & 0xff;
+      case 2: return (w2 >> shift) & 0xff;
+      case 3: return (w3 >> shift) & 0xff;
+      case 4: return (w4 >> shift) & 0xff;
+      default: return (w5 >> shift) & 0xff;
+    }
+}
 
 // ---------------------- Structs ---------------------------
 struct pkzip_hash
@@ -462,14 +462,6 @@ __global__ void m17200_sxx_cuda_optimized(
     const u32 lid = threadIdx.x;
     const u32 lsz = blockDim.x;
 
-    __shared__ u32 l_crc32tab[256];
-    for (u32 i = lid; i < 256; i += lsz)
-    {
-      l_crc32tab[i] = crc32tab[i];
-    }
-
-    __syncthreads();
-
     // Only load the words we actually use for early checks.
     __shared__ u32 l_data[MAX_LOCAL];
     for (u32 i = lid; i < MAX_LOCAL; i += lsz)
@@ -502,10 +494,10 @@ __global__ void m17200_sxx_cuda_optimized(
     {
       const u32 w = pw->i[j];
 
-      update_key012(key0, key1, key2, unpack_v8a_from_v32(w), l_crc32tab);
-      update_key012(key0, key1, key2, unpack_v8b_from_v32(w), l_crc32tab);
-      update_key012(key0, key1, key2, unpack_v8c_from_v32(w), l_crc32tab);
-      update_key012(key0, key1, key2, unpack_v8d_from_v32(w), l_crc32tab);
+      update_key012(key0, key1, key2, unpack_v8a_from_v32(w));
+      update_key012(key0, key1, key2, unpack_v8b_from_v32(w));
+      update_key012(key0, key1, key2, unpack_v8c_from_v32(w));
+      update_key012(key0, key1, key2, unpack_v8d_from_v32(w));
     }
 
     const u32 rem = pw_len & 3;
@@ -514,9 +506,9 @@ __global__ void m17200_sxx_cuda_optimized(
     {
       const u32 w = pw->i[pw_len >> 2];
 
-      if (rem >= 1) update_key012(key0, key1, key2, unpack_v8a_from_v32(w), l_crc32tab);
-      if (rem >= 2) update_key012(key0, key1, key2, unpack_v8b_from_v32(w), l_crc32tab);
-      if (rem >= 3) update_key012(key0, key1, key2, unpack_v8c_from_v32(w), l_crc32tab);
+      if (rem >= 1) update_key012(key0, key1, key2, unpack_v8a_from_v32(w));
+      if (rem >= 2) update_key012(key0, key1, key2, unpack_v8b_from_v32(w));
+      if (rem >= 3) update_key012(key0, key1, key2, unpack_v8c_from_v32(w));
     }
 
     u32 plain;
@@ -527,57 +519,57 @@ __global__ void m17200_sxx_cuda_optimized(
 
     update_key3(key2, key3);
     plain = unpack_v8a_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8b_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8c_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8d_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     next = l_data[1];
 
     update_key3(key2, key3);
     plain = unpack_v8a_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8b_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8c_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8d_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     next = l_data[2];
 
     update_key3(key2, key3);
     plain = unpack_v8a_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8b_from_v32(next) ^ key3;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8c_from_v32(next) ^ key3;
     if ((checksum_size == 2) && ((checksum_from_crc & 0xff) != plain) && ((checksum_from_timestamp & 0xff) != plain)) return;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8d_from_v32(next) ^ key3;
     if ((plain != (checksum_from_crc >> 8)) && (plain != (checksum_from_timestamp >> 8))) return;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     next = l_data[3];
 
@@ -585,7 +577,7 @@ __global__ void m17200_sxx_cuda_optimized(
     plain = unpack_v8a_from_v32(next) ^ key3;
     const u32 btype = plain & 6;
     if (btype == 6) return;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     if (data_length < 36)
     {
@@ -606,52 +598,52 @@ __global__ void m17200_sxx_cuda_optimized(
     update_key3(key2, key3);
     plain = unpack_v8b_from_v32(next) ^ key3;
     tmp0 |= plain << 8;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8c_from_v32(next) ^ key3;
     tmp0 |= plain << 16;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     update_key3(key2, key3);
     plain = unpack_v8d_from_v32(next) ^ key3;
     tmp0 |= plain << 24;
-    update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key012(key0, key1, key2, plain);
 
     next = l_data[4];
 
-    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp1 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp1 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp1 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp1 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp1 |= plain << 0;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp1 |= plain << 8;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp1 |= plain << 16; update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp1 |= plain << 24; update_key012(key0, key1, key2, plain);
 
     next = l_data[5];
 
-    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp2 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp2 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp2 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp2 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp2 |= plain << 0;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp2 |= plain << 8;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp2 |= plain << 16; update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp2 |= plain << 24; update_key012(key0, key1, key2, plain);
 
     next = l_data[6];
 
-    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp3 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp3 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp3 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp3 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp3 |= plain << 0;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp3 |= plain << 8;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp3 |= plain << 16; update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp3 |= plain << 24; update_key012(key0, key1, key2, plain);
 
     next = l_data[7];
 
-    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp4 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp4 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp4 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp4 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp4 |= plain << 0;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp4 |= plain << 8;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp4 |= plain << 16; update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp4 |= plain << 24; update_key012(key0, key1, key2, plain);
 
     next = l_data[8];
 
-    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp5 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp5 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp5 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
-    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp5 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp5 |= plain << 0;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp5 |= plain << 8;  update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp5 |= plain << 16; update_key012(key0, key1, key2, plain);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp5 |= plain << 24; update_key012(key0, key1, key2, plain);
 
     if (btype == 2 && !check_inflate_code1(tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, 24)) return;
     if (btype == 4 && !check_inflate_code2(tmp0, tmp1, tmp2, tmp3, tmp4, tmp5))     return;
