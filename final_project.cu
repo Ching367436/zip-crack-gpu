@@ -22,7 +22,6 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 // ---------------------- Structs (Must match kernel) ---------------------------
-#pragma pack(push,1)
 struct pkzip_hash
 {
     u8  data_type_enum;
@@ -37,7 +36,7 @@ struct pkzip_hash
     u16 checksum_from_crc;
     u16 checksum_from_timestamp;
     u32 data[512]; 
-} __attribute__((packed));
+};
 
 typedef struct pkzip_hash pkzip_hash_t;
 
@@ -47,10 +46,9 @@ struct pkzip
     u8 checksum_size;
     u8 version;
     pkzip_hash_t hash;
-} __attribute__((packed));
+};
 
 typedef struct pkzip pkzip_t;
-#pragma pack(pop)
 
 struct pw_t
 {
@@ -131,10 +129,23 @@ void parse_hash(const std::string& hash_line, pkzip_t& pkzip_struct) {
 }
 
 void pack_password(const std::string& pw, pw_t& pw_struct) {
-    std::memset(pw_struct.i, 0, sizeof(pw_struct.i));
-    pw_struct.pw_len = pw.length();
-    if (pw_struct.pw_len > 64 * 4) pw_struct.pw_len = 64 * 4; 
-    std::memcpy(pw_struct.i, pw.c_str(), pw_struct.pw_len);
+    const size_t max_len = sizeof(pw_struct.i);
+    const size_t len = std::min(pw.size(), max_len);
+
+    pw_struct.pw_len = static_cast<u32>(len);
+
+    if (len)
+    {
+        std::memcpy(pw_struct.i, pw.data(), len);
+
+        // Only clear the unused bytes in the last word to keep the GPU-side
+        // packed representation deterministic without memset()'ing 256 bytes.
+        const size_t padded_len = (len + 3) & ~size_t(3);
+        if (padded_len != len)
+        {
+            std::memset(reinterpret_cast<u8 *>(pw_struct.i) + len, 0, padded_len - len);
+        }
+    }
 }
 
 // ---------------------- CPU Verification ---------------------------
@@ -298,7 +309,7 @@ int main(int argc, char **argv) {
     
     // std::cout << "Generated hash: " << hash_line << std::endl;
 
-    pkzip_t h_pkzip;
+    pkzip_t h_pkzip{};
     parse_hash(hash_line, h_pkzip);
 
     // 2. Setup Device Memory for Hash

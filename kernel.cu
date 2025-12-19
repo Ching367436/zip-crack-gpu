@@ -5,11 +5,12 @@
 using u8  = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
-using u64 = uint64_t;
 
 // ---------------------- Constants -------------------------
-#define MAX_LOCAL 16 // Optimized: only need up to index 8
-#define TMPSIZ 32    // Optimized: only need 24 bytes
+// Only need indices 0..8:
+// - 3 x u32 (12 bytes) PKZIP header
+// - 6 x u32 (24 bytes) encrypted payload for inflate checks
+#define MAX_LOCAL 9
 
 #define MSB(x) ((x) >> 24)
 #define CONST_PK 0x08088405
@@ -37,6 +38,21 @@ __device__ __forceinline__ u32 unpack_v8a_from_v32(u32 v) { return (v >> 0) & 0x
 __device__ __forceinline__ u32 unpack_v8b_from_v32(u32 v) { return (v >> 8) & 0xff; }
 __device__ __forceinline__ u32 unpack_v8c_from_v32(u32 v) { return (v >> 16) & 0xff; }
 __device__ __forceinline__ u32 unpack_v8d_from_v32(u32 v) { return (v >> 24) & 0xff; }
+
+__device__ __forceinline__ u32 get_byte_24 (const u32 w0, const u32 w1, const u32 w2, const u32 w3, const u32 w4, const u32 w5, const u32 idx)
+{
+    const u32 shift = (idx & 3u) << 3;
+
+    switch (idx >> 2)
+    {
+      case 0: return (w0 >> shift) & 0xff;
+      case 1: return (w1 >> shift) & 0xff;
+      case 2: return (w2 >> shift) & 0xff;
+      case 3: return (w3 >> shift) & 0xff;
+      case 4: return (w4 >> shift) & 0xff;
+      default: return (w5 >> shift) & 0xff;
+    }
+}
 
 // ---------------------- CRC32 table -----------------------
 __device__ __constant__ u32 crc32tab[256] = {
@@ -75,7 +91,6 @@ __device__ __constant__ u32 crc32tab[256] = {
 };
 
 // ---------------------- Structs ---------------------------
-#pragma pack(push,1)
 struct pkzip_hash
 {
     u8  data_type_enum;
@@ -90,7 +105,7 @@ struct pkzip_hash
     u16 checksum_from_crc;
     u16 checksum_from_timestamp;
     u32 data[512]; // Kept original size for struct layout compatibility, but we won't load all of it
-} __attribute__((packed));
+};
 
 typedef struct pkzip_hash pkzip_hash_t;
 
@@ -100,10 +115,9 @@ struct pkzip
     u8 checksum_size;
     u8 version;
     pkzip_hash_t hash;
-} __attribute__((packed));
+};
 
 typedef struct pkzip pkzip_t;
-#pragma pack(pop)
 
 struct pw_t
 {
@@ -211,17 +225,26 @@ __device__ __constant__ code distfix[32] = {
 };
 
 // ---------------------- Check helpers ---------------------
-__device__ int check_inflate_code2(u8 *next)
+__device__ int check_inflate_code2 (const u32 w0, const u32 w1, const u32 w2, const u32 w3, const u32 w4, const u32 w5)
 {
-    u32 bits, hold, thisget, have, i;
+    u32 bits, hold, thisget, have;
     int left;
     u32 ncode;
-    u32 ncount[2];
-    u8 *count;
-    hold = *next + (((u32) next[1]) << 8) + (((u32) next[2]) << 16) + (((u32) next[3]) << 24);
-    next += 3;
+    u32 count1 = 0;
+    u32 count2 = 0;
+    u32 count3 = 0;
+    u32 count4 = 0;
+    u32 count5 = 0;
+    u32 count6 = 0;
+    u32 count7 = 0;
+
+    u32 pos = 0;
+    hold = get_byte_24(w0, w1, w2, w3, w4, w5, 0)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 1) << 8)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 2) << 16)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 3) << 24);
+    pos = 3;
     hold >>= 3;
-    count = (u8*)ncount;
 
     if (257 + (hold & 0x1F) > 286)
     {
@@ -236,13 +259,12 @@ __device__ int check_inflate_code2(u8 *next)
     ncode = 4 + (hold & 0xF);
     hold >>= 4;
 
-    hold += ((u32)(*++next)) << 15;
-    hold += ((u32)(*++next)) << 23;
+    hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << 15;
+    hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << 23;
     bits = 31;
 
     have = 0;
 
-    ncount[0] = ncount[1] = 0;
     for (;;)
     {
       if (have + 7 > ncode)
@@ -257,34 +279,41 @@ __device__ int check_inflate_code2(u8 *next)
       bits -= thisget * 3;
       while (thisget--)
       {
-        ++count[hold & 7];
+        switch (hold & 7)
+        {
+          case 1: ++count1; break;
+          case 2: ++count2; break;
+          case 3: ++count3; break;
+          case 4: ++count4; break;
+          case 5: ++count5; break;
+          case 6: ++count6; break;
+          case 7: ++count7; break;
+          default: break;
+        }
         hold >>= 3;
       }
       if (have == ncode)
       {
         break;
       }
-      hold += ((u32)(*++next)) << bits;
+      hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
       bits += 8;
-      hold += ((u32)(*++next)) << bits;
+      hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
       bits += 8;
     }
-    count[0] = 0;
-    if (!ncount[0] && !ncount[1])
+    if ((count1 | count2 | count3 | count4 | count5 | count6 | count7) == 0)
     {
       return 0;
     }
 
     left = 1;
-    for (i = 1; i <= 7; ++i)
-    {
-      left <<= 1;
-      left -= count[i];
-      if (left < 0)
-      {
-        return 0;
-      }
-    }
+    left = (left << 1) - (int) count1; if (left < 0) return 0;
+    left = (left << 1) - (int) count2; if (left < 0) return 0;
+    left = (left << 1) - (int) count3; if (left < 0) return 0;
+    left = (left << 1) - (int) count4; if (left < 0) return 0;
+    left = (left << 1) - (int) count5; if (left < 0) return 0;
+    left = (left << 1) - (int) count6; if (left < 0) return 0;
+    left = (left << 1) - (int) count7; if (left < 0) return 0;
     if (left > 0)
     {
       return 0;
@@ -293,33 +322,37 @@ __device__ int check_inflate_code2(u8 *next)
     return 1;
 }
 
-__device__ int check_inflate_code1(u8 *next, int left)
+__device__ int check_inflate_code1 (const u32 w0, const u32 w1, const u32 w2, const u32 w3, const u32 w4, const u32 w5, int left)
 {
     u32 whave = 0, op, bits, hold, len;
     code here1;
 
-    hold = *next + (((u32) next[1]) << 8) + (((u32) next[2]) << 16) + (((u32) next[3]) << 24);
-    next += 3;
+    u32 pos = 0;
+    hold = get_byte_24(w0, w1, w2, w3, w4, w5, 0)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 1) << 8)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 2) << 16)
+         + (get_byte_24(w0, w1, w2, w3, w4, w5, 3) << 24);
+    pos = 3;
     left -= 4;
     hold >>= 3;
     bits = 32 - 3;
     for (;;)
     {
       if (bits < 15)
-      {
-        if (left < 2)
         {
-          return 1;
+          if (left < 2)
+          {
+            return 1;
+          }
+          left -= 2;
+          hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
+          bits += 8;
+          hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
+          bits += 8;
         }
-        left -= 2;
-        hold += (u32)(*++next) << bits;
-        bits += 8;
-        hold += (u32)(*++next) << bits;
-        bits += 8;
-      }
-      here1 = lenfix[hold & 0x1FF];
-      op = (unsigned)(here1.bits);
-      hold >>= op;
+        here1 = lenfix[hold & 0x1FF];
+        op = (unsigned)(here1.bits);
+        hold >>= op;
       bits -= op;
       op = (unsigned)(here1.op);
       if (op == 0)
@@ -339,7 +372,7 @@ __device__ int check_inflate_code1(u8 *next, int left)
               return 1;
             }
             --left;
-            hold += (u32)(*++next) << bits;
+            hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
             bits += 8;
           }
           len += (unsigned)hold & ((1U << op) - 1);
@@ -353,9 +386,9 @@ __device__ int check_inflate_code1(u8 *next, int left)
             return 1;
           }
           left -= 2;
-          hold += (u32)(*++next) << bits;
+          hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
           bits += 8;
-          hold += (u32)(*++next) << bits;
+          hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
           bits += 8;
         }
         code here2 = distfix[hold & 0x1F];
@@ -374,7 +407,7 @@ __device__ int check_inflate_code1(u8 *next, int left)
               return 1;
             }
             --left;
-            hold += (u32)(*++next) << bits;
+            hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
             bits += 8;
             if (bits < op)
             {
@@ -383,7 +416,7 @@ __device__ int check_inflate_code1(u8 *next, int left)
                 return 1;
               }
               --left;
-              hold += (u32)(*++next) << bits;
+              hold += get_byte_24(w0, w1, w2, w3, w4, w5, ++pos) << bits;
               bits += 8;
             }
           }
@@ -419,27 +452,27 @@ __device__ int check_inflate_code1(u8 *next, int left)
 
 // ---------------------- Kernels ---------------------------
 __global__ void m17200_sxx_cuda_optimized(
-    const pkzip_t *esalt_bufs,
-    const digest_t *digests_buf,
-    const pw_t *pws,
+    const pkzip_t *__restrict__ esalt_bufs,
+    const digest_t *__restrict__ digests_buf,
+    const pw_t *__restrict__ pws,
     u32 gid_cnt,
-    u32 *match_out)
+    u32 *__restrict__ match_out)
 {
-    const u64 gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const u64 lid = threadIdx.x;
-    const u64 lsz = blockDim.x;
+    const u32 gid = (u32)(blockIdx.x * blockDim.x + threadIdx.x);
+    const u32 lid = threadIdx.x;
+    const u32 lsz = blockDim.x;
 
     __shared__ u32 l_crc32tab[256];
-    for (u64 i = lid; i < 256; i += lsz)
+    for (u32 i = lid; i < 256; i += lsz)
     {
       l_crc32tab[i] = crc32tab[i];
     }
 
     __syncthreads();
 
-    // Optimized: only load the first 16 u32s (64 bytes) which covers the header and enough data for early checks
+    // Only load the words we actually use for early checks.
     __shared__ u32 l_data[MAX_LOCAL];
-    for (u64 i = lid; i < MAX_LOCAL; i += lsz)
+    for (u32 i = lid; i < MAX_LOCAL; i += lsz)
     {
       l_data[i] = esalt_bufs[0].hash.data[i];
     }
@@ -454,8 +487,7 @@ __global__ void m17200_sxx_cuda_optimized(
     const u32 checksum_size           = esalt_bufs[0].checksum_size;
     const u32 checksum_from_crc       = esalt_bufs[0].hash.checksum_from_crc;
     const u32 checksum_from_timestamp = esalt_bufs[0].hash.checksum_from_timestamp;
-
-    pw_t t = pws[gid];
+    const u32 data_length             = esalt_bufs[0].hash.data_length;
 
     // Removed apply_rules loop and logic
 
@@ -463,12 +495,28 @@ __global__ void m17200_sxx_cuda_optimized(
     u32 key1 = 0x23456789;
     u32 key2 = 0x34567890;
 
-    for (u32 i = 0, j = 0; i < t.pw_len; i += 4, j += 1)
+    const pw_t *pw = pws + gid;
+    const u32 pw_len = pw->pw_len;
+
+    for (u32 j = 0; j < (pw_len >> 2); j++)
     {
-      if (t.pw_len >= (i + 1)) update_key012(key0, key1, key2, unpack_v8a_from_v32(t.i[j]), l_crc32tab);
-      if (t.pw_len >= (i + 2)) update_key012(key0, key1, key2, unpack_v8b_from_v32(t.i[j]), l_crc32tab);
-      if (t.pw_len >= (i + 3)) update_key012(key0, key1, key2, unpack_v8c_from_v32(t.i[j]), l_crc32tab);
-      if (t.pw_len >= (i + 4)) update_key012(key0, key1, key2, unpack_v8d_from_v32(t.i[j]), l_crc32tab);
+      const u32 w = pw->i[j];
+
+      update_key012(key0, key1, key2, unpack_v8a_from_v32(w), l_crc32tab);
+      update_key012(key0, key1, key2, unpack_v8b_from_v32(w), l_crc32tab);
+      update_key012(key0, key1, key2, unpack_v8c_from_v32(w), l_crc32tab);
+      update_key012(key0, key1, key2, unpack_v8d_from_v32(w), l_crc32tab);
+    }
+
+    const u32 rem = pw_len & 3;
+
+    if (rem)
+    {
+      const u32 w = pw->i[pw_len >> 2];
+
+      if (rem >= 1) update_key012(key0, key1, key2, unpack_v8a_from_v32(w), l_crc32tab);
+      if (rem >= 2) update_key012(key0, key1, key2, unpack_v8b_from_v32(w), l_crc32tab);
+      if (rem >= 3) update_key012(key0, key1, key2, unpack_v8c_from_v32(w), l_crc32tab);
     }
 
     u32 plain;
@@ -531,69 +579,82 @@ __global__ void m17200_sxx_cuda_optimized(
     if ((plain != (checksum_from_crc >> 8)) && (plain != (checksum_from_timestamp >> 8))) return;
     update_key012(key0, key1, key2, plain, l_crc32tab);
 
-    // const u32 key0_sav = key0;
-    // const u32 key1_sav = key1;
-    // const u32 key2_sav = key2;
-
-    u8 tmp[TMPSIZ];
-
     next = l_data[3];
 
     update_key3(key2, key3);
     plain = unpack_v8a_from_v32(next) ^ key3;
-    if ((plain & 6) == 6) return;
-    tmp[0] = plain;
+    const u32 btype = plain & 6;
+    if (btype == 6) return;
     update_key012(key0, key1, key2, plain, l_crc32tab);
+
+    if (data_length < 36)
+    {
+      match_out[gid] = 1;
+      return;
+    }
+
+    // STRICT MODE: Only allow Fixed (2) or Dynamic (4) Huffman codes.
+    if (btype != 2 && btype != 4) return;
+
+    u32 tmp0 = plain << 0;
+    u32 tmp1 = 0;
+    u32 tmp2 = 0;
+    u32 tmp3 = 0;
+    u32 tmp4 = 0;
+    u32 tmp5 = 0;
 
     update_key3(key2, key3);
     plain = unpack_v8b_from_v32(next) ^ key3;
-    tmp[1] = plain;
+    tmp0 |= plain << 8;
     update_key012(key0, key1, key2, plain, l_crc32tab);
 
     update_key3(key2, key3);
     plain = unpack_v8c_from_v32(next) ^ key3;
-    tmp[2] = plain;
+    tmp0 |= plain << 16;
     update_key012(key0, key1, key2, plain, l_crc32tab);
 
     update_key3(key2, key3);
     plain = unpack_v8d_from_v32(next) ^ key3;
-    tmp[3] = plain;
+    tmp0 |= plain << 24;
     update_key012(key0, key1, key2, plain, l_crc32tab);
 
-    for (int i = 16; i < 36; i += 4)
-    {
-      next = l_data[i / 4];
+    next = l_data[4];
 
-      update_key3(key2, key3);
-      plain = unpack_v8a_from_v32(next) ^ key3;
-      tmp[i - 12 + 0] = plain;
-      update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp1 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp1 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp1 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp1 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
 
-      update_key3(key2, key3);
-      plain = unpack_v8b_from_v32(next) ^ key3;
-      tmp[i - 12 + 1] = plain;
-      update_key012(key0, key1, key2, plain, l_crc32tab);
+    next = l_data[5];
 
-      update_key3(key2, key3);
-      plain = unpack_v8c_from_v32(next) ^ key3;
-      tmp[i - 12 + 2] = plain;
-      update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp2 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp2 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp2 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp2 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
 
-      update_key3(key2, key3);
-      plain = unpack_v8d_from_v32(next) ^ key3;
-      tmp[i - 12 + 3] = plain;
-      update_key012(key0, key1, key2, plain, l_crc32tab);
-    }
+    next = l_data[6];
 
-    // Early stop: inspect the first bytes of the encrypted payload (post-header) for
-    // DEFLATE header validity (fixed or dynamic Huffman).
-    // STRICT MODE: Only allow Fixed (2) or Dynamic (4) Huffman codes.
-    u32 btype = (tmp[0]) & 6;
-    if (esalt_bufs[0].hash.data_length >= 36) {
-        if (btype != 2 && btype != 4) return; // Filter out No Compression (0) and Reserved (6)
-        if (btype == 2 && !check_inflate_code1(tmp, 24)) return;
-        if (btype == 4 && !check_inflate_code2(tmp))     return;
-    }
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp3 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp3 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp3 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp3 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+
+    next = l_data[7];
+
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp4 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp4 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp4 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp4 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+
+    next = l_data[8];
+
+    update_key3(key2, key3); plain = unpack_v8a_from_v32(next) ^ key3; tmp5 |= plain << 0;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8b_from_v32(next) ^ key3; tmp5 |= plain << 8;  update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8c_from_v32(next) ^ key3; tmp5 |= plain << 16; update_key012(key0, key1, key2, plain, l_crc32tab);
+    update_key3(key2, key3); plain = unpack_v8d_from_v32(next) ^ key3; tmp5 |= plain << 24; update_key012(key0, key1, key2, plain, l_crc32tab);
+
+    if (btype == 2 && !check_inflate_code1(tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, 24)) return;
+    if (btype == 4 && !check_inflate_code2(tmp0, tmp1, tmp2, tmp3, tmp4, tmp5))     return;
 
     // If we reached here, the password passed all early checks
     match_out[gid] = 1;
