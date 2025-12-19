@@ -119,12 +119,6 @@ struct pkzip
 
 typedef struct pkzip pkzip_t;
 
-struct pw_t
-{
-    u32 i[64];
-    u32 pw_len;
-};
-
 struct digest_t
 {
     u32 digest_buf[4];
@@ -454,7 +448,8 @@ __device__ int check_inflate_code1 (const u32 w0, const u32 w1, const u32 w2, co
 __global__ void m17200_sxx_cuda_optimized(
     const pkzip_t *__restrict__ esalt_bufs,
     const digest_t *__restrict__ digests_buf,
-    const pw_t *__restrict__ pws,
+    const u8 *__restrict__ pw_storage,
+    const u32 *__restrict__ pw_offsets,
     u32 gid_cnt,
     u32 *__restrict__ match_out)
 {
@@ -487,28 +482,12 @@ __global__ void m17200_sxx_cuda_optimized(
     u32 key1 = 0x23456789;
     u32 key2 = 0x34567890;
 
-    const pw_t *pw = pws + gid;
-    const u32 pw_len = pw->pw_len;
+    const u32 start_idx = pw_offsets[gid];
+    const u32 end_idx   = pw_offsets[gid + 1];
 
-    for (u32 j = 0; j < (pw_len >> 2); j++)
+    for (u32 idx = start_idx; idx < end_idx; idx++)
     {
-      const u32 w = pw->i[j];
-
-      update_key012(key0, key1, key2, unpack_v8a_from_v32(w));
-      update_key012(key0, key1, key2, unpack_v8b_from_v32(w));
-      update_key012(key0, key1, key2, unpack_v8c_from_v32(w));
-      update_key012(key0, key1, key2, unpack_v8d_from_v32(w));
-    }
-
-    const u32 rem = pw_len & 3;
-
-    if (rem)
-    {
-      const u32 w = pw->i[pw_len >> 2];
-
-      if (rem >= 1) update_key012(key0, key1, key2, unpack_v8a_from_v32(w));
-      if (rem >= 2) update_key012(key0, key1, key2, unpack_v8b_from_v32(w));
-      if (rem >= 3) update_key012(key0, key1, key2, unpack_v8c_from_v32(w));
+      update_key012(key0, key1, key2, pw_storage[idx]);
     }
 
     u32 plain;

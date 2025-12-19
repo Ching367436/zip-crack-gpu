@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include <cstring>
+#include <limits>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <omp.h>
@@ -54,12 +55,6 @@ struct pkzip
 
 typedef struct pkzip pkzip_t;
 
-struct pw_t
-{
-    u32 i[64];
-    u32 pw_len;
-};
-
 struct digest_t
 {
     u32 digest_buf[4];
@@ -69,7 +64,8 @@ struct digest_t
 __global__ void m17200_sxx_cuda_optimized(
     const pkzip_t *esalt_bufs,
     const digest_t *digests_buf,
-    const pw_t *pws,
+    const u8 *pw_storage,
+    const u32 *pw_offsets,
     u32 gid_cnt,
     u32 *match_out);
 
@@ -132,24 +128,11 @@ void parse_hash(const std::string& hash_line, pkzip_t& pkzip_struct) {
     hex2bin(data_hex, (u8*)pkzip_struct.hash.data, sizeof(pkzip_struct.hash.data));
 }
 
-void pack_password(const std::string& pw, pw_t& pw_struct) {
-    const size_t max_len = sizeof(pw_struct.i);
-    const size_t len = std::min(pw.size(), max_len);
-
-    pw_struct.pw_len = static_cast<u32>(len);
-
-    if (len)
-    {
-        std::memcpy(pw_struct.i, pw.data(), len);
-
-        // Only clear the unused bytes in the last word to keep the GPU-side
-        // packed representation deterministic without memset()'ing 256 bytes.
-        const size_t padded_len = (len + 3) & ~size_t(3);
-        if (padded_len != len)
-        {
-            std::memset(reinterpret_cast<u8 *>(pw_struct.i) + len, 0, padded_len - len);
-        }
-    }
+static size_t default_max_pw_bytes()
+{
+    // Typical wordlists (e.g. rockyou) rarely exceed this, and keeping it small
+    // dramatically reduces H2D bandwidth. Override via ZIPCRACK_MAX_PW_BYTES.
+    return 64;
 }
 
 // ---------------------- CPU Verification ---------------------------
@@ -345,16 +328,47 @@ int main(int argc, char **argv) {
     // 3. Setup Device + Host Memory for Passwords and Results (double-buffered)
     constexpr int kBuffers = 2;
 
-    pw_t *h_pws[kBuffers] = {nullptr, nullptr};
-    u32  *h_match[kBuffers] = {nullptr, nullptr};
+    size_t max_pw_bytes = default_max_pw_bytes();
+    if (const char *env = std::getenv("ZIPCRACK_MAX_PW_BYTES"))
+    {
+        try
+        {
+            max_pw_bytes = std::stoul(env);
+        }
+        catch (...)
+        {
+            std::cerr << "Invalid ZIPCRACK_MAX_PW_BYTES; using default.\n";
+            max_pw_bytes = default_max_pw_bytes();
+        }
+    }
+    if (max_pw_bytes == 0) max_pw_bytes = default_max_pw_bytes();
 
-    std::unique_ptr<pw_t[]> h_pws_pageable[kBuffers];
-    std::unique_ptr<u32[]>  h_match_pageable[kBuffers];
+    const u64 storage_cap_u64 = static_cast<u64>(BATCH_SIZE) * static_cast<u64>(max_pw_bytes);
+    if (storage_cap_u64 > std::numeric_limits<u32>::max())
+    {
+        std::cerr << "ZIPCRACK_MAX_PW_BYTES too large for BATCH_SIZE (offsets use u32).\n";
+        return 1;
+    }
+    const size_t pw_storage_capacity = static_cast<size_t>(storage_cap_u64);
+
+    if (timing)
+    {
+        std::cerr << "Max password bytes: " << max_pw_bytes << "\n";
+    }
+
+    u8  *h_pw_storage[kBuffers] = {nullptr, nullptr};
+    u32 *h_pw_offsets[kBuffers] = {nullptr, nullptr}; // length count+1
+    u32 *h_match[kBuffers]      = {nullptr, nullptr};
+
+    std::unique_ptr<u8[]>  h_pw_storage_pageable[kBuffers];
+    std::unique_ptr<u32[]> h_pw_offsets_pageable[kBuffers];
+    std::unique_ptr<u32[]> h_match_pageable[kBuffers];
 
     bool use_pinned = true;
     for (int i = 0; i < kBuffers; i++)
     {
-        if (cudaMallocHost(&h_pws[i], BATCH_SIZE * sizeof(pw_t)) != cudaSuccess ||
+        if (cudaMallocHost(&h_pw_storage[i], pw_storage_capacity) != cudaSuccess ||
+            cudaMallocHost(&h_pw_offsets[i], (BATCH_SIZE + 1) * sizeof(u32)) != cudaSuccess ||
             cudaMallocHost(&h_match[i], BATCH_SIZE * sizeof(u32)) != cudaSuccess)
         {
             use_pinned = false;
@@ -368,27 +382,33 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < kBuffers; i++)
         {
-            if (h_pws[i]) cudaFreeHost(h_pws[i]);
+            if (h_pw_storage[i]) cudaFreeHost(h_pw_storage[i]);
+            if (h_pw_offsets[i]) cudaFreeHost(h_pw_offsets[i]);
             if (h_match[i]) cudaFreeHost(h_match[i]);
-            h_pws[i] = nullptr;
+            h_pw_storage[i] = nullptr;
+            h_pw_offsets[i] = nullptr;
             h_match[i] = nullptr;
         }
 
         for (int i = 0; i < kBuffers; i++)
         {
-            h_pws_pageable[i] = std::make_unique<pw_t[]>(BATCH_SIZE);
+            h_pw_storage_pageable[i] = std::make_unique<u8[]>(pw_storage_capacity);
+            h_pw_offsets_pageable[i] = std::make_unique<u32[]>(BATCH_SIZE + 1);
             h_match_pageable[i] = std::make_unique<u32[]>(BATCH_SIZE);
-            h_pws[i] = h_pws_pageable[i].get();
+            h_pw_storage[i] = h_pw_storage_pageable[i].get();
+            h_pw_offsets[i] = h_pw_offsets_pageable[i].get();
             h_match[i] = h_match_pageable[i].get();
         }
     }
 
-    pw_t *d_pws[kBuffers] = {nullptr, nullptr};
-    u32  *d_match[kBuffers] = {nullptr, nullptr};
+    u8  *d_pw_storage[kBuffers] = {nullptr, nullptr};
+    u32 *d_pw_offsets[kBuffers] = {nullptr, nullptr};
+    u32 *d_match[kBuffers]      = {nullptr, nullptr};
 
     for (int i = 0; i < kBuffers; i++)
     {
-        cudaMalloc(&d_pws[i], BATCH_SIZE * sizeof(pw_t));
+        cudaMalloc(&d_pw_storage[i], pw_storage_capacity);
+        cudaMalloc(&d_pw_offsets[i], (BATCH_SIZE + 1) * sizeof(u32));
         cudaMalloc(&d_match[i], BATCH_SIZE * sizeof(u32));
     }
 
@@ -433,18 +453,37 @@ int main(int argc, char **argv) {
     std::string correct_password;
     std::atomic<bool> fatal_error{false};
     std::string fatal_error_msg;
+    u64 skipped_too_long = 0;
+    u32 pw_storage_bytes[kBuffers] = {0, 0};
 
     auto fill_batch = [&] (int buf) -> size_t {
         const auto t0 = clock::now();
 
         size_t count = 0;
+        u32 offset = 0;
+        h_pw_offsets[buf][0] = 0;
+
         while (count < BATCH_SIZE && std::getline(dict_file, pw_line))
         {
             if (!pw_line.empty() && pw_line.back() == '\r') pw_line.pop_back();
-            pack_password(pw_line, h_pws[buf][count]);
+
+            if (pw_line.size() > max_pw_bytes)
+            {
+                skipped_too_long++;
+                continue;
+            }
+
+            if (!pw_line.empty())
+            {
+                std::memcpy(h_pw_storage[buf] + offset, pw_line.data(), pw_line.size());
+                offset += static_cast<u32>(pw_line.size());
+            }
+
+            h_pw_offsets[buf][count + 1] = offset;
             count++;
         }
 
+        pw_storage_bytes[buf] = offset;
         cpu_read_pack_ms += ms_since(clock::now() - t0);
         return count;
     };
@@ -454,11 +493,12 @@ int main(int argc, char **argv) {
         const int blocksPerGrid = static_cast<int>((count + threadsPerBlock - 1) / threadsPerBlock);
 
         if (timing) cudaEventRecord(ev_h2d_start[buf], streams[buf]);
-        cudaMemcpyAsync(d_pws[buf], h_pws[buf], count * sizeof(pw_t), cudaMemcpyHostToDevice, streams[buf]);
+        cudaMemcpyAsync(d_pw_storage[buf], h_pw_storage[buf], pw_storage_bytes[buf], cudaMemcpyHostToDevice, streams[buf]);
+        cudaMemcpyAsync(d_pw_offsets[buf], h_pw_offsets[buf], (count + 1) * sizeof(u32), cudaMemcpyHostToDevice, streams[buf]);
         if (timing) cudaEventRecord(ev_h2d_stop[buf], streams[buf]);
 
         if (timing) cudaEventRecord(ev_k_start[buf], streams[buf]);
-        m17200_sxx_cuda_optimized<<<blocksPerGrid, threadsPerBlock, 0, streams[buf]>>>(d_pkzip, d_digest, d_pws[buf], (u32)count, d_match[buf]);
+        m17200_sxx_cuda_optimized<<<blocksPerGrid, threadsPerBlock, 0, streams[buf]>>>(d_pkzip, d_digest, d_pw_storage[buf], d_pw_offsets[buf], (u32)count, d_match[buf]);
         if (timing) cudaEventRecord(ev_k_stop[buf], streams[buf]);
 
         if (timing) cudaEventRecord(ev_d2h_start[buf], streams[buf]);
@@ -492,10 +532,13 @@ int main(int argc, char **argv) {
         {
             if (h_match[buf][i] != 1) continue;
 
-            const pw_t &pw = h_pws[buf][i];
+            const u32 start = h_pw_offsets[buf][i];
+            const u32 end   = h_pw_offsets[buf][i + 1];
+            const u32 len   = end - start;
+
             std::string candidate;
-            candidate.resize(pw.pw_len);
-            if (pw.pw_len) std::memcpy(candidate.data(), pw.i, pw.pw_len);
+            candidate.resize(len);
+            if (len) std::memcpy(candidate.data(), h_pw_storage[buf] + start, len);
             candidates.push_back(std::move(candidate));
         }
 
@@ -607,7 +650,8 @@ int main(int argc, char **argv) {
     {
         for (int i = 0; i < kBuffers; i++)
         {
-            cudaFreeHost(h_pws[i]);
+            cudaFreeHost(h_pw_storage[i]);
+            cudaFreeHost(h_pw_offsets[i]);
             cudaFreeHost(h_match[i]);
         }
     }
@@ -616,7 +660,8 @@ int main(int argc, char **argv) {
     cudaFree(d_digest);
     for (int i = 0; i < kBuffers; i++)
     {
-        cudaFree(d_pws[i]);
+        cudaFree(d_pw_storage[i]);
+        cudaFree(d_pw_offsets[i]);
         cudaFree(d_match[i]);
     }
 
@@ -631,6 +676,7 @@ int main(int argc, char **argv) {
         std::cerr << "Timing summary:\n";
         std::cerr << "  tested:   " << total_pw_tested << "\n";
         std::cerr << "  matches:  " << total_gpu_matches << "\n";
+        std::cerr << "  skipped:  " << skipped_too_long << " (len > " << max_pw_bytes << ")\n";
         std::cerr << "  cpu r/p:  " << std::fixed << std::setprecision(2) << cpu_read_pack_ms << " ms\n";
         std::cerr << "  cpu ver:  " << std::fixed << std::setprecision(2) << cpu_verify_ms << " ms\n";
         std::cerr << "  H2D:      " << std::fixed << std::setprecision(2) << h2d_ms << " ms\n";
