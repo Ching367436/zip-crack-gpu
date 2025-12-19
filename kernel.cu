@@ -104,7 +104,7 @@ struct pkzip_hash
     u32 data_length;
     u16 checksum_from_crc;
     u16 checksum_from_timestamp;
-    u32 data[512]; // Kept original size for struct layout compatibility, but we won't load all of it
+    u32 data[10]; // Kept original size for struct layout compatibility, but we won't load all of it
 };
 
 typedef struct pkzip_hash pkzip_hash_t;

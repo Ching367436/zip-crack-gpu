@@ -37,7 +37,7 @@ struct pkzip_hash
     u32 data_length;
     u16 checksum_from_crc;
     u16 checksum_from_timestamp;
-    u32 data[512]; 
+    u32 data[10]; 
 };
 
 typedef struct pkzip_hash pkzip_hash_t;
